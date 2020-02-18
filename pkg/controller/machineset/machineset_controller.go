@@ -23,8 +23,10 @@ import (
 	actuator "github.com/metal3-io/cluster-api-provider-baremetal/pkg/cloud/baremetal/actuators/machine"
 	machinev1beta1 "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -90,7 +92,7 @@ func (r *ReconcileMachineSet) Reconcile(request reconcile.Request) (reconcile.Re
 	ctx := context.TODO()
 	// Fetch the MachineSet instance
 	instance := &machinev1beta1.MachineSet{}
-	err := r.Get(context.TODO(), request.NamespacedName, instance)
+	err := r.Get(ctx, request.NamespacedName, instance)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Object not found, return.  Created objects are automatically garbage collected.
@@ -111,18 +113,21 @@ func (r *ReconcileMachineSet) Reconcile(request reconcile.Request) (reconcile.Re
 		return reconcile.Result{}, nil
 	}
 
-	selector, err := actuator.SelectorFromProviderSpec(&instance.Spec.Template.Spec.ProviderSpec)
+	// Make sure the MachineSet has a non-empty selector.
+	msselector, err := metav1.LabelSelectorAsSelector(&instance.Spec.Selector)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	if msselector.Empty() {
+		// The cluster-api machinesetcontroller expects every MachineSet to have
+		// its Selector set.
+		log.Info("MachineSet has empty selector, which is unexpected. Will not attempt scaling.")
+		return reconcile.Result{}, nil
+	}
 
-	// The HostSelector limits which BareMetalHosts can be matched with a
-	// Machine. If you have a MachineSet in your cluster that matches *anything*
-	// because it lacks a HostSelector, then if you try to add a second
-	// MachineSet later that does have a HostSelector, the first MachineSet will
-	// compete with it for the same BareMetalHosts.
-	if selector.Empty() {
-		log.Info("MachineSet lacks a HostSelector; adding a future MachineSet may be difficult.")
+	hostselector, err := actuator.SelectorFromProviderSpec(&instance.Spec.Template.Spec.ProviderSpec)
+	if err != nil {
+		return reconcile.Result{}, err
 	}
 
 	hosts := &bmh.BareMetalHostList{}
@@ -137,8 +142,39 @@ func (r *ReconcileMachineSet) Reconcile(request reconcile.Request) (reconcile.Re
 
 	var count int32
 	for _, host := range hosts.Items {
-		if selector.Matches(labels.Set(host.ObjectMeta.Labels)) {
-			count++
+		consumer := host.Spec.ConsumerRef
+		if consumer == nil {
+			if hostselector.Matches(labels.Set(host.ObjectMeta.Labels)) {
+				count++
+				continue
+			}
+		} else {
+			// We will only count this host if it is consumed by a Machine that
+			// is part of the current MachineSet.
+			machine := &machinev1beta1.Machine{}
+			if consumer.Kind != machine.Kind || consumer.APIVersion != machine.APIVersion {
+				// this host is being consumed by something else; don't count it
+				continue
+			}
+
+			// host is being consumed. Let's get the Machine and see if it
+			// matches the current MachineSet.
+			nn := types.NamespacedName{
+				Name:      consumer.Name,
+				Namespace: consumer.Namespace,
+			}
+			err := r.Get(ctx, nn, machine)
+			if err != nil {
+				if errors.IsNotFound(err) {
+					log.Info("Will not scale while BareMetalHost's consuming Machine is not found", "Machine.Name", nn.Name)
+					return reconcile.Result{}, nil
+				}
+				// Error reading the object - requeue the request.
+				return reconcile.Result{}, err
+			}
+			if msselector.Matches(labels.Set(machine.ObjectMeta.Labels)) {
+				count++
+			}
 		}
 	}
 
